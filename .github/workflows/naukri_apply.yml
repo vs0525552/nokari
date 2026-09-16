@@ -1,0 +1,131 @@
+name: "Naukri Auto-Apply - Java Developer (Pune & Mumbai)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULE  (GitHub Actions cron is always UTC)
+#
+#   Target window : 9:00 AM IST  →  3:30 AM UTC
+#   IST = UTC + 5:30
+#   cron "30 3 * * *"  =  03:30 UTC  =  09:00 IST  ✔
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    - cron: "30 3 * * *"    # 09:00 AM IST  (03:30 UTC) — runs every day
+  workflow_dispatch:         # also allows manual trigger from the GitHub UI
+
+permissions:
+  contents: read
+
+jobs:
+  apply-java-jobs:
+    name: "Apply - Java Dev 0-3Yrs | Pune + Mumbai | Last 3 Days"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45      # generous ceiling; script typically finishes in ~15-20 min
+
+    env:
+      NAUKRI_EMAIL:    ${{ secrets.NAUKRI_EMAIL }}
+      NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
+      HEADLESS:        "true"
+      TZ:              "Asia/Kolkata"   # IST for all shell date commands
+
+    steps:
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python 3.11 ─────────────────────────────────────────────
+      - name: "Set up Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Set system timezone to IST ─────────────────────────────────────
+      - name: "Configure system timezone to IST"
+        run: |
+          sudo timedatectl set-timezone Asia/Kolkata
+          echo "System time (IST): $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+      # ── 4. Install Google Chrome (latest stable) ──────────────────────────
+      - name: "Install Google Chrome"
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+            http://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      # ── 5. Install Python dependencies ────────────────────────────────────
+      - name: "Install Python dependencies"
+        run: |
+          pip install --upgrade pip
+          pip install selenium webdriver-manager requests
+
+      # ── 6. Log run start time in IST ──────────────────────────────────────
+      - name: "Run info"
+        run: |
+          echo "============================================================"
+          echo " Naukri Auto-Apply — Java Developer"
+          echo "------------------------------------------------------------"
+          echo " IST start time  : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo " Target jobs     : 10"
+          echo " Experience      : 0 - 3 years"
+          echo " Locations       : Pune, Mumbai"
+          echo " Posted within   : Last 3 days"
+          echo " Apply type      : Easy Apply (Naukri native)"
+          echo "============================================================"
+
+      # ── 7. Run the auto-apply script ──────────────────────────────────────
+      - name: "Run Naukri Auto-Apply"
+        id: apply
+        run: |
+          python main.py --headless 2>&1 | tee apply_log.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        continue-on-error: true    # capture partial success; don't block artifacts
+
+      # ── 8. Upload run log and screenshots ─────────────────────────────────
+      - name: "Upload run artifacts (log + screenshots)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "naukri-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}"
+          path: |
+            apply_log.txt
+            *.png
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # ── 9. Write GitHub Actions step summary ──────────────────────────────
+      - name: "Write step summary"
+        if: always()
+        run: |
+          IST_NOW=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+          echo "## Naukri Auto-Apply — Run Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **IST run time** | $IST_NOW |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Trigger** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target applications** | 10 |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Experience filter** | 0 – 3 years |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Locations** | Pune, Mumbai |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Apply type** | Easy Apply (Naukri-native) only |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Posted within** | Last 3 days |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Extract success/failure counts from the log file
+          SUCCESS=$(grep -c "APPLIED \[" apply_log.txt 2>/dev/null || echo "0")
+          FAILED=$(grep -c "FAILED\|❌\|⚠️" apply_log.txt 2>/dev/null || echo "0")
+
+          echo "### Results" >> $GITHUB_STEP_SUMMARY
+          echo "| | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Successfully Applied | $SUCCESS |" >> $GITHUB_STEP_SUMMARY
+          echo "| ❌ Failed / Skipped | $FAILED |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Full log and screenshots are available in the **Artifacts** section." \
+            >> $GITHUB_STEP_SUMMARY
