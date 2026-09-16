@@ -131,38 +131,123 @@ def build_driver(headless: bool = False) -> webdriver.Chrome:
     return driver
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGIN
+# HUMAN BEHAVIOUR HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def human_sleep(min_s: float, max_s: float) -> None:
+    """Sleep a random duration — simulates human think time."""
+    time.sleep(random.uniform(min_s, max_s))
+
+def human_type(element, text: str) -> None:
+    """Type text character by character with realistic random delays."""
+    for char in text:
+        element.send_keys(char)
+        time.sleep(random.uniform(0.05, 0.18))   # 50–180 ms per keystroke
+    human_sleep(0.3, 0.8)   # brief pause after finishing
+
+def human_scroll(driver, element=None, direction: str = "down", pixels: int = 300) -> None:
+    """
+    Smoothly scroll the page in small steps — mimics a human reading.
+    If element is given, scrolls that element into view first.
+    """
+    if element:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
+            element
+        )
+        human_sleep(0.4, 0.9)
+    else:
+        step = random.randint(80, 140)
+        steps = max(1, pixels // step)
+        sign = 1 if direction == "down" else -1
+        for _ in range(steps):
+            driver.execute_script(f"window.scrollBy(0, {sign * step});")
+            time.sleep(random.uniform(0.05, 0.12))
+        human_sleep(0.3, 0.7)
+
+def dismiss_popup(driver) -> None:
+    """Close any overlay / cookie banner / notification popup if present."""
+    selectors = [
+        "//button[contains(text(),'Accept')]",
+        "//button[contains(text(),'Close')]",
+        "//button[contains(text(),'No Thanks')]",
+        "//button[@aria-label='Close']",
+        "//span[@class='crossIcon']",
+        "//div[contains(@class,'close')]",
+    ]
+    for sel in selectors:
+        try:
+            btn = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable((By.XPATH, sel))
+            )
+            driver.execute_script("arguments[0].click();", btn)
+            human_sleep(0.5, 1.0)
+            return
+        except Exception:
+            continue
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGIN  (navigates directly to login page — works in headless CI)
 # ─────────────────────────────────────────────────────────────────────────────
 def login(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
-    log("🔐  Logging into Naukri …")
-    driver.get("https://www.naukri.com/")
-    time.sleep(3)
+    log("[LOGIN] Navigating directly to Naukri login page ...")
 
-    # Click Login link
-    try:
-        wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Login"))).click()
-    except Exception:
-        wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//a[contains(@href,'login') and contains(text(),'Login')]")
-            )
-        ).click()
-    time.sleep(2)
+    # Go straight to the login page — avoids unreliable "Login" link click
+    driver.get("https://www.naukri.com/nlogin/login")
+    human_sleep(3.5, 5.0)   # let the page fully render
 
+    # Dismiss any popup that may have appeared
+    dismiss_popup(driver)
+
+    # --- Email field ---
     email_input = wait.until(
         EC.presence_of_element_located(
-            (By.XPATH, "//input[@placeholder='Enter your active Email ID / Username']")
+            (By.XPATH, "//input[@placeholder='Enter your active Email ID / Username' or @type='email' or @id='usernameField']")
         )
     )
-    email_input.send_keys(EMAIL)
-    driver.find_element(
-        By.XPATH, "//input[@placeholder='Enter your password']"
-    ).send_keys(PASSWORD)
-    driver.find_element(
-        By.XPATH, "//button[contains(text(),'Login')]"
-    ).click()
-    time.sleep(5)
-    log("✅  Login successful.")
+    human_sleep(0.8, 1.5)   # human reads the form before typing
+    email_input.click()
+    human_sleep(0.3, 0.6)
+    human_type(email_input, EMAIL)
+    log(f"[LOGIN] Email entered.")
+
+    # --- Password field ---
+    pwd_input = wait.until(
+        EC.presence_of_element_located(
+            (By.XPATH, "//input[@placeholder='Enter your password' or @type='password' or @id='passwordField']")
+        )
+    )
+    pwd_input.click()
+    human_sleep(0.4, 0.9)
+    human_type(pwd_input, PASSWORD)
+    log("[LOGIN] Password entered.")
+
+    # --- Click Login button ---
+    human_sleep(0.5, 1.2)   # pause before clicking as if re-checking credentials
+    login_btn = wait.until(
+        EC.element_to_be_clickable(
+            (By.XPATH, "//button[contains(text(),'Login') or @type='submit']")
+        )
+    )
+    driver.execute_script("arguments[0].click();", login_btn)
+    log("[LOGIN] Login button clicked. Waiting for redirect ...")
+
+    # Wait for the page to redirect away from the login URL
+    human_sleep(4.0, 6.0)
+
+    # Verify login success — look for a logged-in indicator
+    try:
+        WebDriverWait(driver, 10).until(
+            lambda d: "nlogin" not in d.current_url
+        )
+        log(f"[LOGIN] Login successful! Current page: {driver.current_url[:60]}")
+    except Exception:
+        # Take a screenshot to diagnose, but don't crash
+        driver.save_screenshot("login_failed.png")
+        log("[LOGIN] WARNING: Could not verify login redirect. Continuing anyway ...")
+
+    dismiss_popup(driver)   # handle any post-login popup
+    human_sleep(1.0, 2.0)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -373,10 +458,9 @@ def apply_for_location(
                 log(f"  🔍  Card #{idx}: Attempting → '{job_title}' | Exp: '{exp_text or 'N/A'}' | {label}")
 
                 # ── LAYER 1: Pre-tab href check — must be naukri.com ──────────
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center'});", card
-                )
-                time.sleep(random.uniform(1.5, 2.5))
+                # Scroll card into view like a human browsing the list
+                human_scroll(driver, element=card)
+                human_sleep(0.8, 1.8)   # glance at the card before clicking
                 job_url = card.find_element(By.TAG_NAME, "a").get_attribute("href") or ""
 
                 if not is_naukri_url(job_url):
@@ -390,7 +474,7 @@ def apply_for_location(
 
                 # ── Open in new tab ───────────────────────────────────────────
                 driver.execute_script("window.open(arguments[0], '_blank');", job_url)
-                time.sleep(WAIT_TAB_OPEN)
+                human_sleep(2.5, 4.0)   # wait for tab to load
                 tab_opened = True
 
                 if len(driver.window_handles) < 2:
@@ -404,7 +488,7 @@ def apply_for_location(
                     continue
 
                 driver.switch_to.window(driver.window_handles[-1])
-                time.sleep(WAIT_TAB_OPEN)
+                human_sleep(2.0, 3.5)   # let the job detail page render
 
                 # ── LAYER 3: Tab URL check — close & skip if not naukri.com ──
                 current_url = driver.current_url
@@ -421,6 +505,13 @@ def apply_for_location(
                     continue
 
                 # ── Verify experience on detail page ──────────────────────────
+                # Simulate reading: scroll down through job desc, then back up
+                human_scroll(driver, direction="down", pixels=random.randint(250, 450))
+                human_sleep(1.5, 3.0)   # human reads the description
+                human_scroll(driver, direction="up", pixels=random.randint(100, 220))
+                human_sleep(0.5, 1.2)
+                dismiss_popup(driver)   # close any popup that appeared while reading
+
                 try:
                     detail_exp = driver.find_element(
                         By.XPATH,
@@ -429,16 +520,18 @@ def apply_for_location(
                     ).text.strip()
                     if detail_exp and not is_experience_in_range(detail_exp):
                         reason = f"Detail-page exp '{detail_exp}' out of range"
-                        log(f"  ⏭️   Card #{idx}: {reason}. Skipping.")
+                        log(f"  [SKIP] Card #{idx}: {reason}. Skipping.")
                         failure_log.append({
                             "title": job_title, "exp": detail_exp,
                             "location": label, "reason": reason, "url": job_url
                         })
                         driver.close()
+                        tab_opened = False
                         driver.switch_to.window(driver.window_handles[0])
                         continue
                 except Exception:
                     pass    # no detail exp element — proceed
+
 
                 # ── LAYER 4: Apply button — reject only explicit external text ─
                 # Click any button whose text contains 'apply' but NOT external keywords.
@@ -474,7 +567,7 @@ def apply_for_location(
                         continue
 
                 if clicked:
-                    time.sleep(WAIT_AFTER_CLICK)
+                    human_sleep(2.0, 3.5)   # wait for apply confirmation to appear
 
                     # ── LAYER 5: Post-click URL — confirm still on naukri.com ─
                     post_click_url = driver.current_url
@@ -551,7 +644,8 @@ def apply_for_location(
                         driver.switch_to.window(driver.window_handles[0])
                 except Exception:
                     pass
-                time.sleep(random.uniform(*WAIT_BETWEEN_CARDS))
+                # Human-like pause between jobs — varies naturally
+                human_sleep(*WAIT_BETWEEN_CARDS)
 
         # ── Pagination ──────────────────────────────────────────────────────────
         if applied >= MAX_APPLY:
