@@ -115,19 +115,34 @@ def build_driver(headless: bool = False) -> webdriver.Chrome:
     options = Options()
     if headless:
         options.add_argument("--headless=new")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    )
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()), options=options
     )
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
+    # CDP-level stealth: hide webdriver flag from JS
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-IN','en']});
+            window.chrome = { runtime: {} };
+        """
+    })
     return driver
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,64 +205,109 @@ def dismiss_popup(driver) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def login(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
     log("[LOGIN] Navigating directly to Naukri login page ...")
-
-    # Go straight to the login page — avoids unreliable "Login" link click
     driver.get("https://www.naukri.com/nlogin/login")
-    human_sleep(3.5, 5.0)   # let the page fully render
+    human_sleep(5.0, 7.0)   # generous wait for CI to fully render the page
 
-    # Dismiss any popup that may have appeared
+    # Debug screenshot — helps diagnose bot-check pages in CI
+    driver.save_screenshot("login_page_debug.png")
+    log(f"[LOGIN] Page loaded. Title: '{driver.title}' | URL: {driver.current_url[:80]}")
+
     dismiss_popup(driver)
 
-    # --- Email field ---
-    email_input = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, "//input[@placeholder='Enter your active Email ID / Username' or @type='email' or @id='usernameField']")
+    # --- Email field: try selectors one by one (most specific first) ---
+    email_input = None
+    for by, sel in [
+        (By.ID,    "usernameField"),
+        (By.NAME,  "username"),
+        (By.XPATH, "//input[@placeholder='Enter your active Email ID / Username']"),
+        (By.XPATH, "//input[@type='text' and contains(@class,'user')]"),
+        (By.XPATH, "(//input[@type='text'])[1]"),
+    ]:
+        try:
+            email_input = WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((by, sel))
+            )
+            log(f"[LOGIN] Email field found via: {by}='{sel}'")
+            break
+        except Exception:
+            continue
+
+    if email_input is None:
+        driver.save_screenshot("login_no_email_field.png")
+        raise RuntimeError(
+            "[LOGIN] Could not locate email input field. "
+            "Check login_page_debug.png and login_no_email_field.png in artifacts."
         )
-    )
-    human_sleep(0.8, 1.5)   # human reads the form before typing
+
+    human_sleep(0.8, 1.5)
     email_input.click()
     human_sleep(0.3, 0.6)
     human_type(email_input, EMAIL)
-    log(f"[LOGIN] Email entered.")
+    log("[LOGIN] Email entered.")
 
     # --- Password field ---
-    pwd_input = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, "//input[@placeholder='Enter your password' or @type='password' or @id='passwordField']")
-        )
-    )
+    pwd_input = None
+    for by, sel in [
+        (By.ID,    "passwordField"),
+        (By.NAME,  "password"),
+        (By.XPATH, "//input[@placeholder='Enter your password']"),
+        (By.XPATH, "//input[@type='password']"),
+    ]:
+        try:
+            pwd_input = WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((by, sel))
+            )
+            log(f"[LOGIN] Password field found via: {by}='{sel}'")
+            break
+        except Exception:
+            continue
+
+    if pwd_input is None:
+        driver.save_screenshot("login_no_pwd_field.png")
+        raise RuntimeError("[LOGIN] Could not locate password input field.")
+
     pwd_input.click()
     human_sleep(0.4, 0.9)
     human_type(pwd_input, PASSWORD)
     log("[LOGIN] Password entered.")
 
-    # --- Click Login button ---
-    human_sleep(0.5, 1.2)   # pause before clicking as if re-checking credentials
-    login_btn = wait.until(
-        EC.element_to_be_clickable(
-            (By.XPATH, "//button[contains(text(),'Login') or @type='submit']")
-        )
-    )
+    # --- Login button ---
+    human_sleep(0.5, 1.2)
+    login_btn = None
+    for by, sel in [
+        (By.XPATH, "//button[@type='submit']"),
+        (By.XPATH, "//button[contains(text(),'Login')]"),
+        (By.XPATH, "//button[contains(text(),'Sign in')]"),
+        (By.XPATH, "(//button)[1]"),
+    ]:
+        try:
+            login_btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((by, sel))
+            )
+            log(f"[LOGIN] Login button found via: {by}='{sel}'")
+            break
+        except Exception:
+            continue
+
+    if login_btn is None:
+        driver.save_screenshot("login_no_btn.png")
+        raise RuntimeError("[LOGIN] Could not locate Login button.")
+
     driver.execute_script("arguments[0].click();", login_btn)
     log("[LOGIN] Login button clicked. Waiting for redirect ...")
+    human_sleep(5.0, 7.0)
 
-    # Wait for the page to redirect away from the login URL
-    human_sleep(4.0, 6.0)
+    driver.save_screenshot("login_after_click.png")
+    log(f"[LOGIN] Post-login URL: {driver.current_url[:80]}")
 
-    # Verify login success — look for a logged-in indicator
-    try:
-        WebDriverWait(driver, 10).until(
-            lambda d: "nlogin" not in d.current_url
-        )
-        log(f"[LOGIN] Login successful! Current page: {driver.current_url[:60]}")
-    except Exception:
-        # Take a screenshot to diagnose, but don't crash
-        driver.save_screenshot("login_failed.png")
-        log("[LOGIN] WARNING: Could not verify login redirect. Continuing anyway ...")
+    # Verify redirect away from login page
+    if "nlogin" in driver.current_url:
+        log("[LOGIN] WARNING: Still on login page — login may have failed. Continuing...")
+    else:
+        log("[LOGIN] Login successful!")
 
-    dismiss_popup(driver)   # handle any post-login popup
+    dismiss_popup(driver)
     human_sleep(1.0, 2.0)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
