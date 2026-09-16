@@ -28,8 +28,14 @@ import random
 import os
 import sys
 import re
+import io
 from datetime import datetime
 from zoneinfo import ZoneInfo          # Python 3.9+; use pytz if older
+
+# Force UTF-8 output on Windows so emojis don't crash the terminal
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMEZONE
@@ -41,8 +47,12 @@ def now_ist() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
 def log(msg: str) -> None:
-    """Print a timestamped log line."""
-    print(f"[{now_ist()}]  {msg}")
+    """Print a timestamped log line (safe on Windows terminals)."""
+    line = f"[{now_ist()}]  {msg}"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", errors="replace").decode("ascii"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -166,10 +176,15 @@ def parse_experience_text(exp_text: str):
 
 
 def is_experience_in_range(exp_text: str) -> bool:
-    """True if the job's experience range overlaps [MIN_EXP_YEARS, MAX_EXP_YEARS]."""
+    """True if the job's experience range overlaps [MIN_EXP_YEARS, MAX_EXP_YEARS].
+    If exp_text is blank or unparseable, returns True (pass through — let the
+    job detail page be the final arbiter).
+    """
+    if not exp_text or not exp_text.strip():
+        return True   # unknown exp on card → don't block, check detail page
     min_e, max_e = parse_experience_text(exp_text)
     if min_e is None:
-        return False        # can't determine — skip
+        return True   # unparseable → pass through
     return min_e <= MAX_EXP_YEARS and max_e >= MIN_EXP_YEARS
 
 
@@ -186,25 +201,24 @@ def is_naukri_url(url: str) -> bool:
     return NAUKRI_DOMAIN in clean
 
 
-# ── LAYER 2: card-level Easy-Apply check ──────────────────────────────────────
+# ── LAYER 2: card-level Easy-Apply check ─────────────────────────────────────
 def is_easy_apply(card) -> bool:
     """
-    NAUKRI-ONLY.  Returns False for ANY hint of an external redirect:
-      • Button text contains known external phrases
-      • Card has a CSS class that marks it as an external post
-      • A redirect/external icon is present in the card DOM
+    NAUKRI-ONLY. Returns False ONLY when there is an explicit external marker:
+      - Button text contains known external phrases (company site, redirect, etc.)
+      - Card HTML has external CSS class markers
+      - Card text explicitly says 'Apply on company site' etc.
+    Blank button text or 'Apply' / 'Apply Now' = easy apply (pass through).
     """
-    # Check 1: apply-button text
+    # Check 1: apply-button text — reject only on explicit external keywords
     try:
         btn = card.find_element(By.CLASS_NAME, "apply-button")
         txt = btn.text.strip().lower()
         if any(kw in txt for kw in EXTERNAL_KEYWORDS):
             return False
-        # Button text must be in the allow-list to be considered easy-apply
-        if txt and txt not in APPLY_BTN_ALLOWLIST:
-            return False
+        # If button text is blank or contains 'apply' → it's easy apply
     except Exception:
-        pass   # no apply-button found on card — check other signals
+        pass   # no apply-button on card — check other signals
 
     # Check 2: card-level CSS class markers Naukri uses for external posts
     try:
@@ -218,7 +232,7 @@ def is_easy_apply(card) -> bool:
     except Exception:
         pass
 
-    # Check 3: does the card contain an explicit "Apply on company site" text node?
+    # Check 3: card text explicitly says 'apply on company site' etc.
     try:
         card_text = card.text.lower()
         if any(kw in card_text for kw in EXTERNAL_KEYWORDS):
@@ -397,9 +411,10 @@ def apply_for_location(
                 except Exception:
                     pass    # no detail exp element — proceed
 
-                # ── LAYER 4: Strict Apply button allow-list ───────────────────
-                # Only click a button whose normalised text is in APPLY_BTN_ALLOWLIST.
-                # Reject anything mentioning company / site / external / redirect.
+                # ── LAYER 4: Apply button — reject only explicit external text ─
+                # Click any button whose text contains 'apply' but NOT external keywords.
+                # This is permissive on purpose — Layer 3 & 5 (URL checks) are the
+                # hard safety net against external sites.
                 clicked = False
                 for selector, by in [
                     ("apply-button",                       By.ID),
@@ -412,25 +427,18 @@ def apply_for_location(
                         )
                         btn_text = btn.text.strip().lower()
 
-                        # Reject if any external keyword appears in button text
+                        # Hard reject: button explicitly says external/company site
                         if any(kw in btn_text for kw in EXTERNAL_KEYWORDS):
                             log(
-                                f"  🚫  LAYER-4 BLOCKED | Card #{idx}: "
-                                f"Button text '{btn_text}' is external. Skipping."
-                            )
-                            clicked = False
-                            break   # no point checking other selectors
-
-                        # Reject if button text is NOT in the allowed set
-                        if btn_text not in APPLY_BTN_ALLOWLIST:
-                            log(
-                                f"  🚫  LAYER-4 BLOCKED | Card #{idx}: "
-                                f"Button text '{btn_text}' not in allow-list. Skipping."
+                                f"  [LAYER-4 BLOCKED] Card #{idx}: "
+                                f"Button '{btn_text}' is external. Skipping."
                             )
                             clicked = False
                             break
 
+                        # Accept: 'apply', 'apply now', or any 'apply*' text
                         driver.execute_script("arguments[0].click();", btn)
+                        log(f"  [LAYER-4 OK] Clicked Apply button: '{btn_text}'")
                         clicked = True
                         break
                     except Exception:
