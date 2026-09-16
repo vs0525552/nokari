@@ -65,6 +65,13 @@ MAX_APPLY     = 10           # stop after exactly 10 successful applications
 MIN_EXP_YEARS = 0
 MAX_EXP_YEARS = 3
 POSTED_DAYS   = 3            # only jobs posted within the last 3 days
+SESSION_DEADLINE_MINUTES = 30  # hard stop after 30 minutes no matter what
+
+# Page load waits (seconds) — longer values help in headless CI
+WAIT_PAGE_LOAD   = 7    # after driver.get()
+WAIT_TAB_OPEN    = 3    # after opening a new tab
+WAIT_AFTER_CLICK = 3    # after clicking Apply
+WAIT_BETWEEN_CARDS = (2.0, 4.0)   # random range between cards
 
 # ── NAUKRI-ONLY GUARD ─────────────────────────────────────────────────────────
 # All URLs must belong to this domain.  Anything else is rejected instantly.
@@ -272,9 +279,11 @@ def apply_for_location(
     applied_so_far: int,
     success_log: list,
     failure_log: list,
+    deadline: float,          # time.time() value — stop at or after this
 ) -> int:
     """
-    Crawl Naukri results for *one* location and apply until MAX_APPLY is hit.
+    Crawl Naukri results for *one* location and apply until MAX_APPLY is hit
+    OR the 30-minute session deadline is reached.
     Returns updated applied count.
     """
     url = build_search_url(location["slug"])
@@ -283,40 +292,57 @@ def apply_for_location(
     page_num = 1
 
     log(separator())
-    log(f"📍  Searching in: {label}")
-    log(f"🔗  URL: {url}")
+    log(f"[SEARCH] Location: {label} | Deadline in: {int((deadline - time.time())/60)} min")
+    log(f"[SEARCH] URL: {url}")
     driver.get(url)
-    time.sleep(5)
+    time.sleep(WAIT_PAGE_LOAD)
 
     while applied < MAX_APPLY:
-        log(separator("·"))
-        log(f"📄  [{label}] Page {page_num} — ✅ Success: {applied}  ❌ Failed: {len(failure_log)}")
+        # ── Hard deadline check ──────────────────────────────────────────
+        if time.time() >= deadline:
+            log(f"[DEADLINE] 30-minute session limit reached. Stopping.")
+            return applied
 
-        # Wait for job listings
-        try:
-            wait.until(
-                EC.presence_of_element_located((By.CLASS_NAME, "srp-jobtuple-wrapper"))
-            )
-        except Exception:
-            driver.save_screenshot(f"search_error_{location['slug']}_p{page_num}.png")
-            log(f"❌  No job listings found on page {page_num}. Screenshot saved. Moving on.")
-            break
+        log(separator("."))
+        log(f"[PAGE {page_num}] [{label}] Applied: {applied}/{MAX_APPLY} | Failed: {len(failure_log)}")
 
-        job_cards = driver.find_elements(By.CLASS_NAME, "srp-jobtuple-wrapper")
+        # Wait for job listings — retry up to 2 times for slow CI loads
+        job_cards = []
+        for attempt in range(1, 4):
+            try:
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "srp-jobtuple-wrapper"))
+                )
+                job_cards = driver.find_elements(By.CLASS_NAME, "srp-jobtuple-wrapper")
+                if job_cards:
+                    break
+                log(f"[PAGE {page_num}] No cards yet (attempt {attempt}/3). Waiting...")
+                time.sleep(5)
+            except Exception:
+                log(f"[PAGE {page_num}] Timeout waiting for cards (attempt {attempt}/3).")
+                time.sleep(5)
+
         if not job_cards:
-            log("⚠️   No job cards on this page. Moving to next location.")
+            driver.save_screenshot(f"search_error_{location['slug']}_p{page_num}.png")
+            log(f"[PAGE {page_num}] No job cards after 3 attempts. Moving to next location.")
             break
 
-        log(f"🃏  Found {len(job_cards)} job card(s) on page {page_num}.")
+        log(f"[PAGE {page_num}] Found {len(job_cards)} card(s).")
 
         for idx, card in enumerate(job_cards, 1):
+            # Deadline check inside card loop too
+            if time.time() >= deadline:
+                log(f"[DEADLINE] Session limit hit mid-page. Stopping.")
+                return applied
+
             if applied >= MAX_APPLY:
-                log(f"🎯  Target of {MAX_APPLY} applications reached!")
+                log(f"[DONE] Target of {MAX_APPLY} applications reached!")
                 return applied
 
             job_title = ""
             exp_text  = ""
             job_url   = ""
+            tab_opened = False   # track whether WE opened a tab (to close in finally)
 
             try:
                 # ── 1. Read title ──────────────────────────────────────────────
@@ -350,12 +376,12 @@ def apply_for_location(
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block: 'center'});", card
                 )
-                time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(1.5, 2.5))
                 job_url = card.find_element(By.TAG_NAME, "a").get_attribute("href") or ""
 
                 if not is_naukri_url(job_url):
                     reason = f"Card href is off-Naukri: {job_url[:80]}"
-                    log(f"  🚫  LAYER-1 BLOCKED | Card #{idx}: {reason}")
+                    log(f"  [L1-BLOCKED] Card #{idx}: {reason}")
                     failure_log.append({
                         "title": job_title, "exp": exp_text,
                         "location": label, "reason": reason, "url": job_url
@@ -364,11 +390,13 @@ def apply_for_location(
 
                 # ── Open in new tab ───────────────────────────────────────────
                 driver.execute_script("window.open(arguments[0], '_blank');", job_url)
-                time.sleep(2)
+                time.sleep(WAIT_TAB_OPEN)
+                tab_opened = True
 
                 if len(driver.window_handles) < 2:
                     reason = "New tab did not open"
-                    log(f"  ⚠️   Card #{idx}: {reason}. Skipping.")
+                    log(f"  [WARN] Card #{idx}: {reason}. Skipping.")
+                    tab_opened = False
                     failure_log.append({
                         "title": job_title, "exp": exp_text,
                         "location": label, "reason": reason, "url": job_url
@@ -376,18 +404,19 @@ def apply_for_location(
                     continue
 
                 driver.switch_to.window(driver.window_handles[-1])
-                time.sleep(2)
+                time.sleep(WAIT_TAB_OPEN)
 
                 # ── LAYER 3: Tab URL check — close & skip if not naukri.com ──
                 current_url = driver.current_url
                 if not is_naukri_url(current_url):
                     reason = f"Tab landed on external site: {current_url[:80]}"
-                    log(f"  🚫  LAYER-3 BLOCKED | Card #{idx}: {reason}")
+                    log(f"  [L3-BLOCKED] Card #{idx}: {reason}")
                     failure_log.append({
                         "title": job_title, "exp": exp_text,
                         "location": label, "reason": reason, "url": job_url
                     })
                     driver.close()
+                    tab_opened = False
                     driver.switch_to.window(driver.window_handles[0])
                     continue
 
@@ -445,31 +474,34 @@ def apply_for_location(
                         continue
 
                 if clicked:
-                    time.sleep(2)
+                    time.sleep(WAIT_AFTER_CLICK)
 
                     # ── LAYER 5: Post-click URL — confirm still on naukri.com ─
                     post_click_url = driver.current_url
                     if not is_naukri_url(post_click_url):
                         reason = f"Apply click navigated off Naukri: {post_click_url[:80]}"
-                        log(f"  🚫  LAYER-5 BLOCKED | Card #{idx}: {reason}")
+                        log(f"  [L5-BLOCKED] Card #{idx}: {reason}")
                         failure_log.append({
                             "title": job_title, "exp": exp_text,
                             "location": label, "reason": reason, "url": job_url
                         })
                         driver.close()
+                        tab_opened = False
                         driver.switch_to.window(driver.window_handles[0])
                         continue
 
-                    # Dismiss any post-apply pop-up (e.g. profile update prompt)
+                    # Dismiss any post-apply pop-up (profile update / confirmation)
                     for dismiss_xpath in [
                         "//button[contains(text(),'Skip')]",
                         "//button[contains(text(),'Not Now')]",
                         "//button[contains(text(),'Close')]",
+                        "//button[@aria-label='Close']",
                     ]:
                         try:
                             WebDriverWait(driver, 3).until(
                                 EC.element_to_be_clickable((By.XPATH, dismiss_xpath))
                             ).click()
+                            time.sleep(1)
                             break
                         except Exception:
                             pass
@@ -484,12 +516,12 @@ def apply_for_location(
                         "time":     now_ist(),
                     })
                     log(
-                        f"  ✅  APPLIED [{applied}/{MAX_APPLY}] → '{job_title}' "
+                        f"  [APPLIED] [{applied}/{MAX_APPLY}] '{job_title}' "
                         f"| Exp: {exp_text or 'N/A'} | {label} | {now_ist()}"
                     )
                 else:
-                    reason = "Apply button not found or text not in allow-list (external guard)"
-                    log(f"  🚫  Card #{idx}: {reason} → '{job_title}'. Skipping.")
+                    reason = "Apply button not found or blocked as external"
+                    log(f"  [SKIP] Card #{idx}: {reason} -> '{job_title}'")
                     failure_log.append({
                         "title": job_title, "exp": exp_text,
                         "location": label, "reason": reason, "url": job_url
@@ -497,9 +529,12 @@ def apply_for_location(
 
             except Exception as exc:
                 screenshot = f"error_{location['slug']}_p{page_num}_card{idx}.png"
-                driver.save_screenshot(screenshot)
+                try:
+                    driver.save_screenshot(screenshot)
+                except Exception:
+                    pass
                 reason = str(exc)[:120]
-                log(f"  ❌  Card #{idx}: Unexpected error — {reason}. Screenshot: {screenshot}")
+                log(f"  [ERROR] Card #{idx}: {reason} | Screenshot: {screenshot}")
                 failure_log.append({
                     "title":    job_title or "Unknown",
                     "exp":      exp_text,
@@ -509,30 +544,33 @@ def apply_for_location(
                 })
 
             finally:
-                # Always close the job tab and return to results
+                # Only close the tab if WE opened it and it's still open
                 try:
-                    if len(driver.window_handles) > 1:
+                    if tab_opened and len(driver.window_handles) > 1:
                         driver.close()
                         driver.switch_to.window(driver.window_handles[0])
                 except Exception:
                     pass
-                time.sleep(random.uniform(1.5, 3.0))
+                time.sleep(random.uniform(*WAIT_BETWEEN_CARDS))
 
         # ── Pagination ──────────────────────────────────────────────────────────
         if applied >= MAX_APPLY:
+            break
+        if time.time() >= deadline:
+            log(f"[DEADLINE] Session limit hit at pagination. Stopping.")
             break
 
         try:
             next_btn = driver.find_element(By.XPATH, "//a[span[text()='Next']]")
             cls = next_btn.get_attribute("class") or ""
             if "disabled" in cls:
-                log(f"  ⏹️   No more pages for {label}.")
+                log(f"[PAGE] No more pages for {label}.")
                 break
             driver.execute_script("arguments[0].click();", next_btn)
             page_num += 1
-            time.sleep(5)
+            time.sleep(WAIT_PAGE_LOAD)   # give the new page time to fully render
         except Exception:
-            log(f"  ⏹️   Next button not found — last page for {label}.")
+            log(f"[PAGE] Next button not found — last page for {label}.")
             break
 
     return applied
@@ -592,47 +630,49 @@ def print_summary(success_log: list, failure_log: list, start_time: str) -> None
 def main():
     headless   = "--headless" in sys.argv or os.environ.get("HEADLESS", "").lower() == "true"
     start_time = now_ist()
+    deadline   = time.time() + SESSION_DEADLINE_MINUTES * 60
 
     print("=" * 70)
-    print("       NAUKRI AUTO-APPLY  —  JAVA DEVELOPER  (0–3 YRS)")
+    print("       NAUKRI AUTO-APPLY  -  JAVA DEVELOPER  (0-3 YRS)")
     print("=" * 70)
-    log(f"🚀  Session started")
-    log(f"   Target      : {MAX_APPLY} applications")
-    log(f"   Experience  : {MIN_EXP_YEARS}–{MAX_EXP_YEARS} years")
-    log(f"   Posted      : Last {POSTED_DAYS} days")
-    log(f"   Locations   : Pune, Mumbai")
-    log(f"   Apply type  : Easy Apply (Naukri-native) only")
-    log(f"   Headless    : {headless}")
+    log(f"[START] Session started")
+    log(f"  Target    : {MAX_APPLY} applications")
+    log(f"  Exp       : {MIN_EXP_YEARS}-{MAX_EXP_YEARS} years")
+    log(f"  Posted    : Last {POSTED_DAYS} days")
+    log(f"  Locations : Pune, Mumbai")
+    log(f"  Deadline  : {SESSION_DEADLINE_MINUTES} minutes from now")
+    log(f"  Headless  : {headless}")
     print("=" * 70)
 
     success_log: list = []
     failure_log: list = []
 
     driver = build_driver(headless=headless)
-    wait   = WebDriverWait(driver, 15)
+    wait   = WebDriverWait(driver, 20)
 
     try:
         login(driver, wait)
         applied = 0
 
-        # Run search for each location in sequence
+        # Scan each location in sequence; stop when 10 applied or deadline hit
         for loc in LOCATIONS:
-            if applied >= MAX_APPLY:
-                log(f"🎯  Target reached before scanning {loc['label']}. Done.")
+            if applied >= MAX_APPLY or time.time() >= deadline:
                 break
+            log(f"[LOC] Scanning {loc['label']} | Applied so far: {applied}/{MAX_APPLY}")
             applied = apply_for_location(
-                driver, wait, loc, applied, success_log, failure_log
+                driver, wait, loc, applied, success_log, failure_log, deadline
             )
 
+        reason = "Deadline reached" if time.time() >= deadline else "All pages exhausted"
         if applied < MAX_APPLY:
-            log(
-                f"⚠️   Could only apply to {applied}/{MAX_APPLY} jobs across "
-                f"Pune + Mumbai in the last {POSTED_DAYS} days."
-            )
+            log(f"[DONE] Session ended: {applied}/{MAX_APPLY} applied. Reason: {reason}")
 
     except Exception as exc:
-        log(f"💥  Fatal error: {exc}")
-        driver.save_screenshot("fatal_error.png")
+        log(f"[FATAL] {exc}")
+        try:
+            driver.save_screenshot("fatal_error.png")
+        except Exception:
+            pass
         failure_log.append({
             "title": "FATAL", "exp": "", "location": "",
             "reason": str(exc)[:120], "url": ""
@@ -640,8 +680,16 @@ def main():
         raise
 
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
         print_summary(success_log, failure_log, start_time)
+
+
+if __name__ == "__main__":
+    main()
+
 
 
 if __name__ == "__main__":

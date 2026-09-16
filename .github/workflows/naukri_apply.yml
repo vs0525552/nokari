@@ -22,7 +22,7 @@ jobs:
   apply-java-jobs:
     name: "Apply - Java Dev 0-3Yrs | Pune + Mumbai | Last 3 Days"
     runs-on: ubuntu-latest
-    timeout-minutes: 45      # generous ceiling; script typically finishes in ~15-20 min
+    timeout-minutes: 40      # script runs up to 30 min + ~5 min setup headroom
 
     env:
       NAUKRI_EMAIL:    ${{ secrets.NAUKRI_EMAIL }}
