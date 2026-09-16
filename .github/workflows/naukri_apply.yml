@@ -48,12 +48,24 @@ jobs:
           sudo timedatectl set-timezone Asia/Kolkata
           echo "System time (IST): $(date '+%Y-%m-%d %H:%M:%S %Z')"
 
-      # ── 4. Install Google Chrome (latest stable via direct .deb) ─────────
+      # ── 4. Install Google Chrome + matching ChromeDriver ─────────────────
       - name: "Install Google Chrome"
         run: |
+          # Install Chrome
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
-          google-chrome --version
+          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+\.\d+')
+          echo "Chrome version: $CHROME_VERSION"
+
+          # Install matching ChromeDriver via Chrome for Testing JSON API
+          CHROME_MAJOR=$(echo $CHROME_VERSION | cut -d. -f1)
+          DRIVER_URL=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}")
+          wget -q "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_URL}/linux64/chromedriver-linux64.zip"
+          unzip -q chromedriver-linux64.zip
+          sudo mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
+          sudo chmod +x /usr/local/bin/chromedriver
+          chromedriver --version
+          echo "CHROMEDRIVER_PATH=/usr/local/bin/chromedriver" >> $GITHUB_ENV
 
       # ── 5. Install Python dependencies ────────────────────────────────────
       - name: "Install Python dependencies"

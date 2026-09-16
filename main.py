@@ -22,7 +22,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 import time
 import random
 import os
@@ -131,9 +130,14 @@ def build_driver(headless: bool = False) -> webdriver.Chrome:
     )
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()), options=options
-    )
+    # In CI: use the exact chromedriver we installed (CHROMEDRIVER_PATH env var)
+    # Locally: Selenium's built-in manager auto-detects the right version
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "")
+    if chromedriver_path:
+        driver = webdriver.Chrome(service=Service(chromedriver_path), options=options)
+        log(f"[DRIVER] Using ChromeDriver from: {chromedriver_path}")
+    else:
+        driver = webdriver.Chrome(options=options)
     # CDP-level stealth: hide webdriver flag from JS
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": """
